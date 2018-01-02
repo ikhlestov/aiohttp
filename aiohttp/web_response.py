@@ -1,16 +1,18 @@
-import asyncio
+import collections
 import datetime
 import enum
 import json
 import math
 import time
 import warnings
+import zlib
 from email.utils import parsedate
+from http.cookies import SimpleCookie
 
 from multidict import CIMultiDict, CIMultiDictProxy
 
 from . import hdrs, payload
-from .helpers import HeadersMixin, SimpleCookie, sentinel
+from .helpers import HeadersMixin, rfc822_formatted_time, sentinel
 from .http import RESPONSES, SERVER_SOFTWARE, HttpVersion10, HttpVersion11
 
 
@@ -32,7 +34,7 @@ class ContentCoding(enum.Enum):
 ############################################################
 
 
-class StreamResponse(HeadersMixin):
+class StreamResponse(collections.MutableMapping, HeadersMixin):
 
     _length_check = True
 
@@ -48,6 +50,7 @@ class StreamResponse(HeadersMixin):
         self._payload_writer = None
         self._eof_sent = False
         self._body_length = 0
+        self._state = {}
 
         if headers is not None:
             self._headers = CIMultiDict(headers)
@@ -88,7 +91,7 @@ class StreamResponse(HeadersMixin):
         if reason is None:
             try:
                 reason = _RESPONSES[self._status][0]
-            except:
+            except Exception:
                 reason = ''
         self._reason = reason
 
@@ -260,33 +263,6 @@ class StreamResponse(HeadersMixin):
         elif isinstance(value, str):
             self.headers[hdrs.LAST_MODIFIED] = value
 
-    @property
-    def tcp_nodelay(self):
-        payload_writer = self._payload_writer
-        assert payload_writer is not None, \
-            "Cannot get tcp_nodelay for not prepared response"
-        return payload_writer.tcp_nodelay
-
-    def set_tcp_nodelay(self, value):
-        payload_writer = self._payload_writer
-        assert payload_writer is not None, \
-            "Cannot set tcp_nodelay for not prepared response"
-        payload_writer.set_tcp_nodelay(value)
-
-    @property
-    def tcp_cork(self):
-        payload_writer = self._payload_writer
-        assert payload_writer is not None, \
-            "Cannot get tcp_cork for not prepared response"
-        return payload_writer.tcp_cork
-
-    def set_tcp_cork(self, value):
-        payload_writer = self._payload_writer
-        assert payload_writer is not None, \
-            "Cannot set tcp_cork for not prepared response"
-
-        payload_writer.set_tcp_cork(value)
-
     def _generate_content_type_header(self, CONTENT_TYPE=hdrs.CONTENT_TYPE):
         params = '; '.join("%s=%s" % i for i in self._content_dict.items())
         if params:
@@ -299,7 +275,9 @@ class StreamResponse(HeadersMixin):
         if coding != ContentCoding.identity:
             self.headers[hdrs.CONTENT_ENCODING] = coding.value
             self._payload_writer.enable_compression(coding.value)
-            self._chunked = True
+            # Compressed payload may have different content length,
+            # remove the header
+            self._headers.popall(hdrs.CONTENT_LENGTH, None)
 
     def _start_compression(self, request):
         if self._compression_force:
@@ -312,14 +290,13 @@ class StreamResponse(HeadersMixin):
                     self._do_start_compression(coding)
                     return
 
-    @asyncio.coroutine
-    def prepare(self, request):
+    async def prepare(self, request):
         if self._eof_sent:
             return
         if self._payload_writer is not None:
             return self._payload_writer
 
-        yield from request._prepare_hook(self)
+        await request._prepare_hook(self)
         return self._start(request)
 
     def _start(self, request,
@@ -341,7 +318,7 @@ class StreamResponse(HeadersMixin):
         self._keep_alive = keep_alive
 
         version = request.version
-        writer = self._payload_writer = request._writer
+        writer = self._payload_writer = request._payload_writer
 
         headers = self._headers
         for cookie in self._cookies.values():
@@ -362,14 +339,17 @@ class StreamResponse(HeadersMixin):
                 del headers[CONTENT_LENGTH]
         elif self._length_check:
             writer.length = self.content_length
-            if writer.length is None and version >= HttpVersion11:
-                writer.enable_chunking()
-                headers[TRANSFER_ENCODING] = 'chunked'
-                if CONTENT_LENGTH in headers:
-                    del headers[CONTENT_LENGTH]
+            if writer.length is None:
+                if version >= HttpVersion11:
+                    writer.enable_chunking()
+                    headers[TRANSFER_ENCODING] = 'chunked'
+                    if CONTENT_LENGTH in headers:
+                        del headers[CONTENT_LENGTH]
+                else:
+                    keep_alive = False
 
         headers.setdefault(CONTENT_TYPE, 'application/octet-stream')
-        headers.setdefault(DATE, request.time_service.strtime())
+        headers.setdefault(DATE, rfc822_formatted_time())
         headers.setdefault(SERVER, SERVER_SOFTWARE)
 
         # connection header
@@ -388,7 +368,7 @@ class StreamResponse(HeadersMixin):
 
         return writer
 
-    def write(self, data):
+    async def write(self, data):
         assert isinstance(data, (bytes, bytearray, memoryview)), \
             "data argument must be byte-ish (%r)" % type(data)
 
@@ -397,17 +377,18 @@ class StreamResponse(HeadersMixin):
         if self._payload_writer is None:
             raise RuntimeError("Cannot call write() before prepare()")
 
-        return self._payload_writer.write(data)
+        await self._payload_writer.write(data)
 
-    @asyncio.coroutine
-    def drain(self):
+    async def drain(self):
         assert not self._eof_sent, "EOF has already been sent"
         assert self._payload_writer is not None, \
             "Response has not been started"
-        yield from self._payload_writer.drain()
+        warnings.warn("drain method is deprecated, use await resp.write()",
+                      DeprecationWarning,
+                      stacklevel=2)
+        await self._payload_writer.drain()
 
-    @asyncio.coroutine
-    def write_eof(self, data=b''):
+    async def write_eof(self, data=b''):
         assert isinstance(data, (bytes, bytearray, memoryview)), \
             "data argument must be byte-ish (%r)" % type(data)
 
@@ -417,7 +398,7 @@ class StreamResponse(HeadersMixin):
         assert self._payload_writer is not None, \
             "Response has not been started"
 
-        yield from self._payload_writer.write_eof(data)
+        await self._payload_writer.write_eof(data)
         self._eof_sent = True
         self._req = None
         self._body_length = self._payload_writer.output_size
@@ -433,6 +414,24 @@ class StreamResponse(HeadersMixin):
         return "<{} {} {}>".format(self.__class__.__name__,
                                    self.reason, info)
 
+    def __getitem__(self, key):
+        return self._state[key]
+
+    def __setitem__(self, key, value):
+        self._state[key] = value
+
+    def __delitem__(self, key):
+        del self._state[key]
+
+    def __len__(self):
+        return len(self._state)
+
+    def __iter__(self):
+        return iter(self._state)
+
+    def __hash__(self):
+        return hash(id(self))
+
 
 class Response(StreamResponse):
 
@@ -447,7 +446,7 @@ class Response(StreamResponse):
         elif not isinstance(headers, (CIMultiDict, CIMultiDictProxy)):
             headers = CIMultiDict(headers)
 
-        if content_type is not None and ";" in content_type:
+        if content_type is not None and "charset" in content_type:
             raise ValueError("charset must not be in content_type "
                              "argument")
 
@@ -489,6 +488,8 @@ class Response(StreamResponse):
         else:
             self.body = body
 
+        self._compressed_body = None
+
     @property
     def body(self):
         return self._body
@@ -513,12 +514,10 @@ class Response(StreamResponse):
 
             headers = self._headers
 
-            # enable chunked encoding if needed
+            # set content-length header if needed
             if not self._chunked and CONTENT_LENGTH not in headers:
                 size = body.size
-                if size is None:
-                    self._chunked = True
-                elif CONTENT_LENGTH not in headers:
+                if size is not None:
                     headers[CONTENT_LENGTH] = str(size)
 
             # set content-type
@@ -530,6 +529,8 @@ class Response(StreamResponse):
                 for (key, value) in body.headers.items():
                     if key not in headers:
                         headers[key] = value
+
+        self._compressed_body = None
 
     @property
     def text(self):
@@ -549,6 +550,7 @@ class Response(StreamResponse):
 
         self._body = text.encode(self.charset)
         self._body_payload = False
+        self._compressed_body = None
 
     @property
     def content_length(self):
@@ -558,7 +560,13 @@ class Response(StreamResponse):
         if hdrs.CONTENT_LENGTH in self.headers:
             return super().content_length
 
-        if self._body is not None:
+        if self._compressed_body is not None:
+            # Return length of the compressed body
+            return len(self._compressed_body)
+        elif self._body_payload:
+            # A payload without content length, or a compressed payload
+            return None
+        elif self._body is not None:
             return len(self._body)
         else:
             return 0
@@ -567,29 +575,49 @@ class Response(StreamResponse):
     def content_length(self, value):
         raise RuntimeError("Content length is set automatically")
 
-    @asyncio.coroutine
-    def write_eof(self):
-        body = self._body
+    async def write_eof(self):
+        if self._eof_sent:
+            return
+        if self._compressed_body is not None:
+            body = self._compressed_body
+        else:
+            body = self._body
         if body is not None:
             if (self._req._method == hdrs.METH_HEAD or
                     self._status in [204, 304]):
-                yield from super().write_eof()
+                await super().write_eof()
             elif self._body_payload:
-                yield from body.write(self._payload_writer)
-                yield from super().write_eof()
+                await body.write(self._payload_writer)
+                await super().write_eof()
             else:
-                yield from super().write_eof(body)
+                await super().write_eof(body)
         else:
-            yield from super().write_eof()
+            await super().write_eof()
 
     def _start(self, request):
         if not self._chunked and hdrs.CONTENT_LENGTH not in self._headers:
-            if self._body is not None:
-                self._headers[hdrs.CONTENT_LENGTH] = str(len(self._body))
-            else:
-                self._headers[hdrs.CONTENT_LENGTH] = '0'
+            if not self._body_payload:
+                if self._body is not None:
+                    self._headers[hdrs.CONTENT_LENGTH] = str(len(self._body))
+                else:
+                    self._headers[hdrs.CONTENT_LENGTH] = '0'
 
         return super()._start(request)
+
+    def _do_start_compression(self, coding):
+        if self._body_payload or self._chunked:
+            return super()._do_start_compression(coding)
+        if coding != ContentCoding.identity:
+            # Instead of using _payload_writer.enable_compression,
+            # compress the whole body
+            zlib_mode = (16 + zlib.MAX_WBITS
+                         if coding.value == 'gzip' else -zlib.MAX_WBITS)
+            compressobj = zlib.compressobj(wbits=zlib_mode)
+            self._compressed_body = compressobj.compress(self._body) +\
+                compressobj.flush()
+            self._headers[hdrs.CONTENT_ENCODING] = coding.value
+            self._headers[hdrs.CONTENT_LENGTH] = \
+                str(len(self._compressed_body))
 
 
 def json_response(data=sentinel, *, text=None, body=None, status=200,

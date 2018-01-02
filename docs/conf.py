@@ -13,10 +13,11 @@
 # All configuration values have a default; values that are commented out
 # serve to show the default.
 
-import sys
-import os
 import codecs
+import os
 import re
+import sys
+
 
 _docs_path = os.path.dirname(__file__)
 _version_path = os.path.abspath(os.path.join(_docs_path,
@@ -55,7 +56,6 @@ extensions = [
     'sphinx.ext.intersphinx',
     'alabaster',
     'sphinxcontrib.asyncio',
-    'sphinxcontrib.newsfeed',
 ]
 
 
@@ -74,6 +74,8 @@ intersphinx_mapping = {
         ('https://yarl.readthedocs.io/en/stable/', None),
     'aiohttpjinja2':
         ('https://aiohttp-jinja2.readthedocs.io/en/stable/', None),
+    'aiohttpremotes':
+        ('https://aiohttp-remotes.readthedocs.io/en/stable/', None),
     'aiohttpsession':
         ('https://aiohttp-session.readthedocs.io/en/stable/', None)}
 
@@ -91,7 +93,7 @@ master_doc = 'index'
 
 # General information about the project.
 project = 'aiohttp'
-copyright = '2013-2017, Aiohttp contributors'
+copyright = '2013-2018, Aiohttp contributors'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -155,7 +157,8 @@ html_theme = 'alabaster'
 # documentation.
 html_theme_options = {
     'logo': 'aiohttp-icon-128x128.png',
-    'description': 'http client/server for asyncio',
+    'description': 'Async HTTP client/server for asyncio and Python',
+    'canonical_url': 'http://docs.aiohttp.org/en/stable/',
     'github_user': 'aio-libs',
     'github_repo': 'aiohttp',
     'github_button': True,
@@ -169,6 +172,9 @@ html_theme_options = {
     'body_text': '#482C0A',
     'sidebar_text': '#49443E',
     'sidebar_header': '#4B4032',
+    'font_family': "'Roboto', sans-serif",
+    'head_font_family': "'Roboto Slab', serif",
+    'code_font_family': "'Roboto Mono', monospace",
 }
 
 # Add any paths that contain custom themes here, relative to this directory.
@@ -326,6 +332,3 @@ texinfo_documents = [
 
 # If true, do not generate a @detailmenu in the "Top" node's menu.
 # texinfo_no_detailmenu = False
-
-
-disqus_shortname = 'aiohttp'

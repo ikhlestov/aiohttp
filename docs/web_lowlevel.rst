@@ -30,8 +30,7 @@ parameter and performs one of the following actions:
 
   2. Create a :class:`StreamResponse`, send headers by
      :meth:`StreamResponse.prepare` call, send data chunks by
-     :meth:`StreamResponse.write` / :meth:`StreamResponse.drain`,
-     return finished response.
+     :meth:`StreamResponse.write` and return finished response.
 
   3. Raise :class:`HTTPException` derived exception (see
      :ref:`aiohttp-web-exceptions` section).
@@ -87,7 +86,3 @@ Web-Socket for every *path*.
 
 The example is very basic: it always return ``200 OK`` response, real
 life code should be much more complex.
-
-
-.. disqus::
-  :title: aiohttp.web low-level server

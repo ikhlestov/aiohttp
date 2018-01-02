@@ -8,7 +8,7 @@ Testing
 Testing aiohttp web servers
 ---------------------------
 
-aiohttp provides plugin for pytest_ making writing web server tests
+aiohttp provides plugin for *pytest* making writing web server tests
 extremely easy, it also provides :ref:`test framework agnostic
 utilities <aiohttp-testing-framework-agnostic-utilities>` for testing
 with other frameworks such as :ref:`unittest
@@ -128,7 +128,7 @@ app test client::
 
 Pytest tooling has the following fixtures:
 
-.. data:: test_server(app, **kwargs)
+.. data:: test_server(app, *, port=None, **kwargs)
 
    A fixture factory that creates
    :class:`~aiohttp.test_utils.TestServer`::
@@ -144,11 +144,16 @@ Pytest tooling has the following fixtures:
    *app* is the :class:`aiohttp.web.Application` used
                            to start server.
 
+   *port* optional, port the server is run at, if
+   not provided a random unused port is used.
+
+   .. versionadded:: 3.0
+
    *kwargs* are parameters passed to
                   :meth:`aiohttp.web.Application.make_handler`
 
 
-.. data:: test_client(app, **kwargs)
+.. data:: test_client(app, server_kwargs=None, **kwargs)
           test_client(server, **kwargs)
           test_client(raw_server, **kwargs)
 
@@ -168,17 +173,17 @@ Pytest tooling has the following fixtures:
    :class:`aiohttp.test_utils.TestServer` or
    :class:`aiohttp.test_utils.RawTestServer` instance.
 
+   *server_kwargs* are parameters passed to the test server if an app
+   is passed, else ignored.
+
    *kwargs* are parameters passed to
    :class:`aiohttp.test_utils.TestClient` constructor.
 
-.. data:: raw_test_server(handler, **kwargs)
+.. data:: raw_test_server(handler, *, port=None, **kwargs)
 
    A fixture factory that creates
    :class:`~aiohttp.test_utils.RawTestServer` instance from given web
-   handler.
-
-   *handler* should be a coroutine which accepts a request and returns
-   response, e.g.::
+   handler.::
 
       async def test_f(raw_test_server, test_client):
 
@@ -188,6 +193,27 @@ Pytest tooling has the following fixtures:
           raw_server = await raw_test_server(handler)
           client = await test_client(raw_server)
           resp = await client.get('/')
+
+   *handler* should be a coroutine which accepts a request and returns
+   response, e.g.
+
+   *port* optional, port the server is run at, if
+   not provided a random unused port is used.
+
+   .. versionadded:: 3.0
+
+.. data:: unused_port()
+
+   Function to return an unused port number for IPv4 TCP protocol::
+
+      async def test_f(test_client, unused_port):
+          port = unused_port()
+          app = web.Application()
+          # fill route table
+
+          client = await test_client(app, server_kwargs={'port': port})
+          ...
+
 
 .. _aiohttp-testing-unittest-example:
 
@@ -243,6 +269,12 @@ functionality, the AioHTTPTestCase is provided::
 
        an aiohttp test client, :class:`TestClient` instance.
 
+    .. attribute:: server
+
+       an aiohttp test server, :class:`TestServer` instance.
+
+       .. versionadded:: 2.3
+
     .. attribute:: loop
 
        The event loop in which the application and server are running.
@@ -252,6 +284,24 @@ functionality, the AioHTTPTestCase is provided::
        The application returned by :meth:`get_app`
        (:class:`aiohttp.web.Application` instance).
 
+    .. comethod:: get_client()
+
+       This async method can be overridden to return the :class:`TestClient`
+       object used in the test.
+
+       :return: :class:`TestClient` instance.
+
+       .. versionadded:: 2.3
+
+    .. comethod:: get_server()
+
+       This async method can be overridden to return the :class:`TestServer`
+       object used in the test.
+
+       :return: :class:`TestServer` instance.
+
+       .. versionadded:: 2.3
+
     .. comethod:: get_application()
 
        This async method should be overridden
@@ -259,6 +309,20 @@ functionality, the AioHTTPTestCase is provided::
        object to test.
 
        :return: :class:`aiohttp.web.Application` instance.
+
+    .. comethod:: setUpAsync()
+
+       This async method do nothing by default and can be overridden to execute
+       asynchronous code during the ``setUp`` stage of the ``TestCase``.
+
+       .. versionadded:: 2.3
+
+    .. comethod:: tearDownAsync()
+
+       This async method do nothing by default and can be overridden to execute
+       asynchronous code during the ``tearDown`` stage of the ``TestCase``.
+
+       .. versionadded:: 2.3
 
     .. method:: setUp()
 
@@ -331,12 +395,13 @@ conditions that hard to reproduce on real server::
                                   version=HttpVersion(1, 1), \
                                   closing=False, \
                                   app=None, \
+                                  match_info=sentinel, \
                                   reader=sentinel, \
                                   writer=sentinel, \
                                   transport=sentinel, \
                                   payload=sentinel, \
                                   sslcontext=None, \
-                                  secure_proxy_ssl_header=None)
+                                  loop=...)
 
    Creates mocked web.Request testing purposes.
 
@@ -352,6 +417,9 @@ conditions that hard to reproduce on real server::
    :param headers: mapping containing the headers. Can be anything accepted
        by the multidict.CIMultiDict constructor.
    :type headers: dict, multidict.CIMultiDict, list of pairs
+
+   :param match_info: mapping containing the info to match with url parameters.
+   :type match_info: dict
 
    :param version: namedtuple with encoded HTTP version
    :type version: aiohttp.protocol.HttpVersion
@@ -375,12 +443,13 @@ conditions that hard to reproduce on real server::
    :param sslcontext: ssl.SSLContext object, for HTTPS connection
    :type sslcontext: ssl.SSLContext
 
-   :param secure_proxy_ssl_header: A tuple representing a HTTP header/value
-       combination that signifies a request is secure.
-   :type secure_proxy_ssl_header: tuple
+   :param loop: An event loop instance, mocked loop by default.
+   :type loop: :class:`asyncio.AbstractEventLoop`
 
    :return: :class:`aiohttp.web.Request` object.
 
+   .. versionadded:: 2.3
+      *match_info* parameter.
 
 .. _aiohttp-testing-writing-testable-services:
 
@@ -520,7 +589,7 @@ Test server usually works in conjunction with
 :class:`aiohttp.test_utils.TestClient` which provides handy client methods
 for accessing to the server.
 
-.. class:: BaseTestServer(*, scheme='http', host='127.0.0.1')
+.. class:: BaseTestServer(*, scheme='http', host='127.0.0.1', port=None)
 
    Base class for test servers.
 
@@ -529,11 +598,15 @@ for accessing to the server.
    :param str host: a host for TCP socket, IPv4 *local host*
       (``'127.0.0.1'``) by default.
 
+   :param int port: optional port for TCP socket, if not provided a
+      random unused port is used.
+
+      .. versionadded:: 3.0
 
    .. attribute:: scheme
 
       A *scheme* for tested application, ``'http'`` for non-protected
-      run and ``'htttps'`` for TLS encrypted server.
+      run and ``'https'`` for TLS encrypted server.
 
    .. attribute:: host
 
@@ -541,7 +614,7 @@ for accessing to the server.
 
    .. attribute:: port
 
-      A random *port* used to start a server.
+      *port* used to start the test server.
 
    .. attribute:: handler
 
@@ -587,6 +660,11 @@ for accessing to the server.
    :param str host: a host for TCP socket, IPv4 *local host*
       (``'127.0.0.1'``) by default.
 
+   :param int port: optional port for TCP socket, if not provided a
+      random unused port is used.
+
+      .. versionadded:: 3.0
+
 
 .. class:: TestServer(app, *, scheme="http", host='127.0.0.1')
 
@@ -600,6 +678,10 @@ for accessing to the server.
    :param str host: a host for TCP socket, IPv4 *local host*
       (``'127.0.0.1'``) by default.
 
+   :param int port: optional port for TCP socket, if not provided a
+      random unused port is used.
+
+      .. versionadded:: 3.0
 
    .. attribute:: app
 
@@ -637,7 +719,7 @@ Test Client
    .. attribute:: scheme
 
       A *scheme* for tested application, ``'http'`` for non-protected
-      run and ``'htttps'`` for TLS encrypted server.
+      run and ``'https'`` for TLS encrypted server.
 
    .. attribute:: host
 
@@ -645,7 +727,7 @@ Test Client
 
    .. attribute:: port
 
-      A random *port* used to start a server.
+      *port* used to start the server
 
    .. attribute:: server
 
@@ -767,7 +849,3 @@ Utilities
 
 .. _pytest: http://pytest.org/latest/
 .. _pytest-aiohttp: https://pypi.python.org/pypi/pytest-aiohttp
-
-
-.. disqus::
-  :title: aiohttp testing

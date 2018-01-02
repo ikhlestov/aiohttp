@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import contextlib
 import tempfile
 import warnings
@@ -6,21 +7,22 @@ import warnings
 import pytest
 from py import path
 
+from aiohttp.helpers import isasyncgenfunction
 from aiohttp.web import Application
 
 from .test_utils import unused_port as _unused_port
-from .test_utils import (RawTestServer, TestClient, TestServer, loop_context,
-                         setup_test_loop, teardown_test_loop)
+from .test_utils import (BaseTestServer, RawTestServer, TestClient, TestServer,
+                         loop_context, setup_test_loop, teardown_test_loop)
 
 
 try:
     import uvloop
-except:  # pragma: no cover
+except ImportError:  # pragma: no cover
     uvloop = None
 
 try:
     import tokio
-except:  # pragma: no cover
+except ImportError:  # pragma: no cover
     tokio = None
 
 
@@ -29,17 +31,79 @@ def pytest_addoption(parser):
         '--fast', action='store_true', default=False,
         help='run tests faster by disabling extra checks')
     parser.addoption(
-        '--loop', action='append', default=[],
-        help='run tests with specific loop: pyloop, uvloop, tokio')
+        '--loop', action='store', default='pyloop',
+        help='run tests with specific loop: pyloop, uvloop, tokio or all')
     parser.addoption(
         '--enable-loop-debug', action='store_true', default=False,
         help='enable event loop debug mode')
 
 
+def pytest_fixture_setup(fixturedef):
+    """
+    Allow fixtures to be coroutines. Run coroutine fixtures in an event loop.
+    """
+    func = fixturedef.func
+
+    if isasyncgenfunction(func):
+        # async generator fixture
+        is_async_gen = True
+    elif asyncio.iscoroutinefunction(func):
+        # regular async fixture
+        is_async_gen = False
+    else:
+        # not an async fixture, nothing to do
+        return
+
+    strip_request = False
+    if 'request' not in fixturedef.argnames:
+        fixturedef.argnames += ('request',)
+        strip_request = True
+
+    def wrapper(*args, **kwargs):
+        request = kwargs['request']
+        if strip_request:
+            del kwargs['request']
+
+        # if neither the fixture nor the test use the 'loop' fixture,
+        # 'getfixturevalue' will fail because the test is not parameterized
+        # (this can be removed someday if 'loop' is no longer parameterized)
+        if 'loop' not in request.fixturenames:
+            raise Exception(
+                "Asynchronous fixtures must depend on the 'loop' fixture or "
+                "be used in tests depending from it."
+            )
+
+        _loop = request.getfixturevalue('loop')
+
+        if is_async_gen:
+            # for async generators, we need to advance the generator once,
+            # then advance it again in a finalizer
+            gen = func(*args, **kwargs)
+
+            def finalizer():
+                try:
+                    return _loop.run_until_complete(gen.__anext__())
+                except StopAsyncIteration:  # NOQA
+                    pass
+
+            request.addfinalizer(finalizer)
+            return _loop.run_until_complete(gen.__anext__())
+        else:
+            return _loop.run_until_complete(func(*args, **kwargs))
+
+    fixturedef.func = wrapper
+
+
 @pytest.fixture
 def fast(request):
-    """ --fast config option """
-    return request.config.getoption('--fast')  # pragma: no cover
+    """--fast config option"""
+    return request.config.getoption('--fast')
+
+
+@pytest.fixture
+def loop_debug(request):
+    """--enable-loop-debug config option"""
+    return request.config.getoption('--enable-loop-debug')
 
 
 @contextlib.contextmanager
@@ -104,60 +168,47 @@ def pytest_pyfunc_call(pyfuncitem):
         return True
 
 
-def pytest_configure(config):
-    loops = config.getoption('--loop')
+def pytest_generate_tests(metafunc):
+    if 'loop_factory' not in metafunc.fixturenames:
+        return
 
-    factories = {'pyloop': asyncio.new_event_loop}
+    loops = metafunc.config.option.loop
+    avail_factories = {'pyloop': asyncio.new_event_loop}
 
     if uvloop is not None:  # pragma: no cover
-        factories['uvloop'] = uvloop.new_event_loop
+        avail_factories['uvloop'] = uvloop.new_event_loop
 
     if tokio is not None:  # pragma: no cover
-        factories['tokio'] = tokio.new_event_loop
+        avail_factories['tokio'] = tokio.new_event_loop
 
-    LOOP_FACTORIES.clear()
-    LOOP_FACTORY_IDS.clear()
+    if loops == 'all':
+        loops = 'pyloop,uvloop?,tokio?'
 
-    if loops:
-        for names in (name.split(',') for name in loops):
-            for name in names:
-                name = name.strip()
-                if name not in factories:
-                    raise ValueError(
-                        "Unknown loop '%s', available loops: %s" % (
-                            name, list(factories.keys())))
-
-                LOOP_FACTORIES.append(factories[name])
-                LOOP_FACTORY_IDS.append(name)
-    else:
-        LOOP_FACTORIES.append(asyncio.new_event_loop)
-        LOOP_FACTORY_IDS.append('pyloop')
-
-        if uvloop is not None:  # pragma: no cover
-            LOOP_FACTORIES.append(uvloop.new_event_loop)
-            LOOP_FACTORY_IDS.append('uvloop')
-
-        if tokio is not None:
-            LOOP_FACTORIES.append(tokio.new_event_loop)
-            LOOP_FACTORY_IDS.append('tokio')
-
-    asyncio.set_event_loop(None)
+    factories = {}
+    for name in loops.split(','):
+        required = not name.endswith('?')
+        name = name.strip(' ?')
+        if name not in avail_factories:  # pragma: no cover
+            if required:
+                raise ValueError(
+                    "Unknown loop '%s', available loops: %s" % (
+                        name, list(factories.keys())))
+            else:
+                continue
+        factories[name] = avail_factories[name]
+    metafunc.parametrize("loop_factory",
+                         list(factories.values()),
+                         ids=list(factories.keys()))
 
 
-LOOP_FACTORIES = []
-LOOP_FACTORY_IDS = []
-
-
-@pytest.fixture(params=LOOP_FACTORIES, ids=LOOP_FACTORY_IDS)
-def loop(request):
+@pytest.fixture
+def loop(loop_factory, fast, loop_debug):
     """Return an instance of the event loop."""
-    fast = request.config.getoption('--fast')
-    debug = request.config.getoption('--enable-loop-debug')
-
-    with loop_context(request.param, fast=fast) as _loop:
-        if debug:
+    with loop_context(loop_factory, fast=fast) as _loop:
+        if loop_debug:
             _loop.set_debug(True)  # pragma: no cover
         yield _loop
+    asyncio.set_event_loop(None)
 
 
 @pytest.fixture
@@ -174,19 +225,17 @@ def test_server(loop):
     """
     servers = []
 
-    @asyncio.coroutine
-    def go(app, **kwargs):
-        server = TestServer(app)
-        yield from server.start_server(loop=loop, **kwargs)
+    async def go(app, *, port=None, **kwargs):
+        server = TestServer(app, port=port)
+        await server.start_server(loop=loop, **kwargs)
         servers.append(server)
         return server
 
     yield go
 
-    @asyncio.coroutine
-    def finalize():
+    async def finalize():
         while servers:
-            yield from servers.pop().close()
+            await servers.pop().close()
 
     loop.run_until_complete(finalize())
 
@@ -199,19 +248,17 @@ def raw_test_server(loop):
     """
     servers = []
 
-    @asyncio.coroutine
-    def go(handler, **kwargs):
-        server = RawTestServer(handler)
-        yield from server.start_server(loop=loop, **kwargs)
+    async def go(handler, *, port=None, **kwargs):
+        server = RawTestServer(handler, port=port)
+        await server.start_server(loop=loop, **kwargs)
         servers.append(server)
         return server
 
     yield go
 
-    @asyncio.coroutine
-    def finalize():
+    async def finalize():
         while servers:
-            yield from servers.pop().close()
+            await servers.pop().close()
 
     loop.run_until_complete(finalize())
 
@@ -226,31 +273,33 @@ def test_client(loop):
     """
     clients = []
 
-    @asyncio.coroutine
-    def go(__param, *args, **kwargs):
+    async def go(__param, *args, server_kwargs=None, **kwargs):
+
+        if isinstance(__param, collections.Callable) and \
+                not isinstance(__param, (Application, BaseTestServer)):
+            __param = __param(loop, *args, **kwargs)
+            kwargs = {}
+        else:
+            assert not args, "args should be empty"
+
         if isinstance(__param, Application):
-            assert not args, "args should be empty"
-            client = TestClient(__param, loop=loop, **kwargs)
-        elif isinstance(__param, TestServer):
-            assert not args, "args should be empty"
-            client = TestClient(__param, loop=loop, **kwargs)
-        elif isinstance(__param, RawTestServer):
-            assert not args, "args should be empty"
+            server_kwargs = server_kwargs or {}
+            server = TestServer(__param, loop=loop, **server_kwargs)
+            client = TestClient(server, loop=loop, **kwargs)
+        elif isinstance(__param, BaseTestServer):
             client = TestClient(__param, loop=loop, **kwargs)
         else:
-            __param = __param(loop, *args, **kwargs)
-            client = TestClient(__param, loop=loop)
+            raise ValueError("Unknown argument type: %r" % type(__param))
 
-        yield from client.start_server()
+        await client.start_server()
         clients.append(client)
         return client
 
     yield go
 
-    @asyncio.coroutine
-    def finalize():
+    async def finalize():
         while clients:
-            yield from clients.pop().close()
+            await clients.pop().close()
 
     loop.run_until_complete(finalize())
 

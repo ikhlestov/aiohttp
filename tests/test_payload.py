@@ -1,4 +1,4 @@
-import asyncio
+from io import StringIO
 
 import pytest
 
@@ -15,8 +15,7 @@ def registry():
 
 class Payload(payload.Payload):
 
-    @asyncio.coroutine
-    def write(self, writer):
+    async def write(self, writer):
         pass
 
 
@@ -56,3 +55,11 @@ def test_string_payload():
         'test', content_type='text/plain; charset=koi8-r')
     assert p.encoding == 'koi8-r'
     assert p.content_type == 'text/plain; charset=koi8-r'
+
+
+def test_string_io_payload():
+    s = StringIO('ű' * 5000)
+    p = payload.StringIOPayload(s)
+    assert p.encoding == 'utf-8'
+    assert p.content_type == 'text/plain; charset=utf-8'
+    assert p.size == 10000

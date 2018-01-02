@@ -38,7 +38,7 @@ instance to override default logger.
 
 .. note::
 
-   Use ``app.make_handler(access_log=None)`` for disabling access logs.
+   Use ``web.run_app(app, access_log=None)`` for disabling access logs.
 
 
 Other parameter called *access_log_format* may be used for specifying log
@@ -71,8 +71,6 @@ request and response:
 +--------------+---------------------------------------------------------+
 | ``%b``       | Size of response in bytes, excluding HTTP headers       |
 +--------------+---------------------------------------------------------+
-| ``%O``       | Bytes sent, including headers                           |
-+--------------+---------------------------------------------------------+
 | ``%T``       | The time taken to serve the request, in seconds         |
 +--------------+---------------------------------------------------------+
 | ``%Tf``      | The time taken to serve the request, in seconds         |
@@ -84,13 +82,25 @@ request and response:
 +--------------+---------------------------------------------------------+
 | ``%{FOO}o``  | ``response.headers['FOO']``                             |
 +--------------+---------------------------------------------------------+
-| ``%{FOO}e``  | ``os.environ['FOO']``                                   |
-+--------------+---------------------------------------------------------+
 
 Default access log format is::
 
-   '%a %l %u %t "%r" %s %b "%{Referrer}i" "%{User-Agent}i"'
+   '%a %t "%r" %s %b "%{Referer}i" "%{User-Agent}i"'
 
+.. versionadded:: 2.3.0
+
+*access_log_class* introduced.
+
+Example of drop-in replacement for :class:`aiohttp.helpers.AccessLogger`::
+
+  from aiohttp.abc import AbstractAccessLogger
+
+  class AccessLogger(AbstractAccessLogger):
+
+      def log(self, request, response, time):
+          self.logger.info(f'{request.remote} '
+                           f'"{request.method} {request.path} '
+                           f'done in {time}s: {response.status}')
 
 .. note::
 
@@ -117,7 +127,3 @@ To use different logger name please specify *logger* parameter
 
 .. _access_logformat:
     http://docs.gunicorn.org/en/stable/settings.html#access-log-format
-
-
-.. disqus::
-  :title: aiohttp logging

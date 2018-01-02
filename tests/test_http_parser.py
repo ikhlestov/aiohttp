@@ -15,6 +15,12 @@ from aiohttp.http_parser import (DeflateBuffer, HttpPayloadParser,
                                  HttpRequestParserPy, HttpResponseParserPy)
 
 
+try:
+    import brotli
+except ImportError:
+    brotli = None
+
+
 REQUEST_PARSERS = [HttpRequestParserPy]
 RESPONSE_PARSERS = [HttpResponseParserPy]
 
@@ -66,8 +72,8 @@ test2: data\r
     assert len(messages) == 1
     msg = messages[0][0]
 
-    assert list(msg.headers.items()) == [('Test', 'line continue'),
-                                         ('Test2', 'data')]
+    assert list(msg.headers.items()) == [('test', 'line continue'),
+                                         ('test2', 'data')]
     assert msg.raw_headers == ((b'test', b'line continue'),
                                (b'test2', b'data'))
     assert not msg.should_close
@@ -87,13 +93,21 @@ def test_parse(parser):
     assert msg.version == (1, 1)
 
 
-@asyncio.coroutine
-def test_parse_body(parser):
+async def test_parse_body(parser):
     text = b'GET /test HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody'
     messages, upgrade, tail = parser.feed_data(text)
     assert len(messages) == 1
     _, payload = messages[0]
-    body = yield from payload.read(4)
+    body = await payload.read(4)
+    assert body == b'body'
+
+
+async def test_parse_body_with_CRLF(parser):
+    text = b'\r\nGET /test HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody'
+    messages, upgrade, tail = parser.feed_data(text)
+    assert len(messages) == 1
+    _, payload = messages[0]
+    body = await payload.read(4)
     assert body == b'body'
 
 
@@ -124,8 +138,29 @@ def test_headers_multi_feed(parser):
     assert len(messages) == 1
 
     msg = messages[0][0]
-    assert list(msg.headers.items()) == [('Test', 'line continue')]
+    assert list(msg.headers.items()) == [('test', 'line continue')]
     assert msg.raw_headers == ((b'test', b'line continue'),)
+    assert not msg.should_close
+    assert msg.compression is None
+    assert not msg.upgrade
+
+
+def test_headers_split_field(parser):
+    text1 = b'GET /test HTTP/1.1\r\n'
+    text2 = b't'
+    text3 = b'es'
+    text4 = b't: value\r\n\r\n'
+
+    messages, upgrade, tail = parser.feed_data(text1)
+    messages, upgrade, tail = parser.feed_data(text2)
+    messages, upgrade, tail = parser.feed_data(text3)
+    assert len(messages) == 0
+    messages, upgrade, tail = parser.feed_data(text4)
+    assert len(messages) == 1
+
+    msg = messages[0][0]
+    assert list(msg.headers.items()) == [('test', 'value')]
+    assert msg.raw_headers == ((b'test', b'value'),)
     assert not msg.should_close
     assert msg.compression is None
     assert not msg.upgrade
@@ -217,7 +252,7 @@ def test_request_chunked(parser):
     msg, payload = messages[0]
     assert msg.chunked
     assert not upgrade
-    assert isinstance(payload, streams.FlowControlStreamReader)
+    assert isinstance(payload, streams.StreamReader)
 
 
 def test_conn_upgrade(parser):
@@ -229,6 +264,14 @@ def test_conn_upgrade(parser):
     assert not msg.should_close
     assert msg.upgrade
     assert upgrade
+
+
+def test_compression_empty(parser):
+    text = (b'GET /test HTTP/1.1\r\n'
+            b'content-encoding: \r\n\r\n')
+    messages, upgrade, tail = parser.feed_data(text)
+    msg = messages[0][0]
+    assert msg.compression is None
 
 
 def test_compression_deflate(parser):
@@ -247,12 +290,21 @@ def test_compression_gzip(parser):
     assert msg.compression == 'gzip'
 
 
+@pytest.mark.skipif(brotli is None, reason="brotli is not installed")
+def test_compression_brotli(parser):
+    text = (b'GET /test HTTP/1.1\r\n'
+            b'content-encoding: br\r\n\r\n')
+    messages, upgrade, tail = parser.feed_data(text)
+    msg = messages[0][0]
+    assert msg.compression == 'br'
+
+
 def test_compression_unknown(parser):
     text = (b'GET /test HTTP/1.1\r\n'
             b'content-encoding: compress\r\n\r\n')
     messages, upgrade, tail = parser.feed_data(text)
     msg = messages[0][0]
-    assert not msg.compression
+    assert msg.compression is None
 
 
 def test_headers_connect(parser):
@@ -261,7 +313,7 @@ def test_headers_connect(parser):
     messages, upgrade, tail = parser.feed_data(text)
     msg, payload = messages[0]
     assert upgrade
-    assert isinstance(payload, streams.FlowControlStreamReader)
+    assert isinstance(payload, streams.StreamReader)
 
 
 def test_headers_old_websocket_key1(parser):
@@ -465,11 +517,12 @@ def test_http_request_chunked_payload(parser):
 
     assert msg.chunked
     assert not payload.is_eof()
-    assert isinstance(payload, streams.FlowControlStreamReader)
+    assert isinstance(payload, streams.StreamReader)
 
     parser.feed_data(b'4\r\ndata\r\n4\r\nline\r\n0\r\n\r\n')
 
     assert b'dataline' == b''.join(d for d in payload._buffer)
+    assert [4, 8] == payload._http_chunk_splits
     assert payload.is_eof()
 
 
@@ -484,6 +537,7 @@ def test_http_request_chunked_payload_and_next_message(parser):
         b'transfer-encoding: chunked\r\n\r\n')
 
     assert b'dataline' == b''.join(d for d in payload._buffer)
+    assert [4, 8] == payload._http_chunk_splits
     assert payload.is_eof()
 
     assert len(messages) == 1
@@ -503,14 +557,17 @@ def test_http_request_chunked_payload_chunks(parser):
     parser.feed_data(b'\n4')
     parser.feed_data(b'\r')
     parser.feed_data(b'\n')
-    parser.feed_data(b'line\r\n0\r\n')
+    parser.feed_data(b'li')
+    parser.feed_data(b'ne\r\n0\r\n')
     parser.feed_data(b'test: test\r\n')
 
     assert b'dataline' == b''.join(d for d in payload._buffer)
+    assert [4, 8] == payload._http_chunk_splits
     assert not payload.is_eof()
 
     parser.feed_data(b'\r\n')
     assert b'dataline' == b''.join(d for d in payload._buffer)
+    assert [4, 8] == payload._http_chunk_splits
     assert payload.is_eof()
 
 
@@ -523,6 +580,7 @@ def test_parse_chunked_payload_chunk_extension(parser):
         b'4;test\r\ndata\r\n4\r\nline\r\n0\r\ntest: test\r\n\r\n')
 
     assert b'dataline' == b''.join(d for d in payload._buffer)
+    assert [4, 8] == payload._http_chunk_splits
     assert payload.is_eof()
 
 
@@ -560,6 +618,33 @@ def test_parse_length_payload(response):
 def test_parse_no_length_payload(parser):
     text = b'PUT / HTTP/1.1\r\n\r\n'
     msg, payload = parser.feed_data(text)[0][0]
+    assert payload.is_eof()
+
+
+def test_partial_url(parser):
+    messages, upgrade, tail = parser.feed_data(b'GET /te')
+    assert len(messages) == 0
+    messages, upgrade, tail = parser.feed_data(b'st HTTP/1.1\r\n\r\n')
+    assert len(messages) == 1
+
+    msg, payload = messages[0]
+
+    assert msg.method == 'GET'
+    assert msg.path == '/test'
+    assert msg.version == (1, 1)
+    assert payload.is_eof()
+
+
+def test_url_parse_non_strict_mode(parser):
+    payload = 'GET /test/тест HTTP/1.1\r\n\r\n'.encode('utf-8')
+    messages, upgrade, tail = parser.feed_data(payload)
+    assert len(messages) == 1
+
+    msg, payload = messages[0]
+
+    assert msg.method == 'GET'
+    assert msg.path == '/test/тест'
+    assert msg.version == (1, 1)
     assert payload.is_eof()
 
 
@@ -623,10 +708,32 @@ class TestParsePayload(unittest.TestCase):
         self.assertEqual(b'data', b''.join(d for d, _ in out._buffer))
         self.assertTrue(out.is_eof())
 
+    def test_http_payload_parser_deflate_no_wbits(self):
+        comp = zlib.compressobj()
+        COMPRESSED = b''.join([comp.compress(b'data'), comp.flush()])
+
+        length = len(COMPRESSED)
+        out = aiohttp.FlowControlDataQueue(self.stream)
+        p = HttpPayloadParser(
+            out, length=length, compression='deflate')
+        p.feed_data(COMPRESSED)
+        self.assertEqual(b'data', b''.join(d for d, _ in out._buffer))
+        self.assertTrue(out.is_eof())
+
     def test_http_payload_parser_length_zero(self):
         out = aiohttp.FlowControlDataQueue(self.stream)
         p = HttpPayloadParser(out, length=0)
         self.assertTrue(p.done)
+        self.assertTrue(out.is_eof())
+
+    @pytest.mark.skipif(brotli is None, reason="brotli is not installed")
+    def test_http_payload_brotli(self):
+        compressed = brotli.compress(b'brotli data')
+        out = aiohttp.FlowControlDataQueue(self.stream)
+        p = HttpPayloadParser(
+            out, length=len(compressed), compression='br')
+        p.feed_data(compressed)
+        self.assertEqual(b'brotli data', b''.join(d for d, _ in out._buffer))
         self.assertTrue(out.is_eof())
 
 
@@ -640,8 +747,8 @@ class TestDeflateBuffer(unittest.TestCase):
         buf = aiohttp.FlowControlDataQueue(self.stream)
         dbuf = DeflateBuffer(buf, 'deflate')
 
-        dbuf.zlib = mock.Mock()
-        dbuf.zlib.decompress.return_value = b'line'
+        dbuf.decompressor = mock.Mock()
+        dbuf.decompressor.decompress.return_value = b'line'
 
         dbuf.feed_data(b'data', 4)
         self.assertEqual([b'line'], list(d for d, _ in buf._buffer))
@@ -651,8 +758,8 @@ class TestDeflateBuffer(unittest.TestCase):
         dbuf = DeflateBuffer(buf, 'deflate')
 
         exc = ValueError()
-        dbuf.zlib = mock.Mock()
-        dbuf.zlib.decompress.side_effect = exc
+        dbuf.decompressor = mock.Mock()
+        dbuf.decompressor.decompress.side_effect = exc
 
         self.assertRaises(
             http_exceptions.ContentEncodingError, dbuf.feed_data, b'data', 4)
@@ -661,8 +768,8 @@ class TestDeflateBuffer(unittest.TestCase):
         buf = aiohttp.FlowControlDataQueue(self.stream)
         dbuf = DeflateBuffer(buf, 'deflate')
 
-        dbuf.zlib = mock.Mock()
-        dbuf.zlib.flush.return_value = b'line'
+        dbuf.decompressor = mock.Mock()
+        dbuf.decompressor.flush.return_value = b'line'
 
         dbuf.feed_eof()
         self.assertEqual([b'line'], list(d for d, _ in buf._buffer))
@@ -672,9 +779,9 @@ class TestDeflateBuffer(unittest.TestCase):
         buf = aiohttp.FlowControlDataQueue(self.stream)
         dbuf = DeflateBuffer(buf, 'deflate')
 
-        dbuf.zlib = mock.Mock()
-        dbuf.zlib.flush.return_value = b'line'
-        dbuf.zlib.eof = False
+        dbuf.decompressor = mock.Mock()
+        dbuf.decompressor.flush.return_value = b'line'
+        dbuf.decompressor.eof = False
 
         self.assertRaises(http_exceptions.ContentEncodingError, dbuf.feed_eof)
 
